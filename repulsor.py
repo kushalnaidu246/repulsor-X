@@ -7,6 +7,7 @@ Run:  .venv/bin/python repulsor.py        (q / ESC to quit)
 from __future__ import annotations
 
 import argparse
+import itertools
 import math
 import random
 import time
@@ -49,6 +50,19 @@ class Particle:
 def unit(v: np.ndarray) -> np.ndarray:
     n = float(np.linalg.norm(v))
     return v / n if n > 1e-6 else v
+
+
+def assign(centres: list[np.ndarray], states: list[HandState]) -> tuple[int, ...]:
+    """Pick which state slot each detected hand belongs to.
+
+    MediaPipe's result order is not stable between frames, so match detections to the
+    slots that were tracked last frame by nearest centre (lowest total distance).
+    Slots not seen last frame cost a fixed penalty, so tracked hands keep their slot.
+    """
+    def cost(c, s):
+        return float(np.linalg.norm(c - s.center)) if s.seen else 1e6
+    return min(itertools.permutations(range(len(states)), len(centres)),
+               key=lambda perm: sum(cost(c, states[j]) for c, j in zip(centres, perm)))
 
 
 def is_open(pts: np.ndarray) -> bool:
@@ -208,6 +222,7 @@ def main():
     states = [HandState(), HandState()]
     parts: list[Particle] = []
     flash, last, t0 = 0.0, time.perf_counter(), time.perf_counter()
+    last_ts = -1
     renderer = None
 
     with vision.HandLandmarker.create_from_options(options) as landmarker:
@@ -222,19 +237,24 @@ def main():
             now = time.perf_counter()
             dt, t, last = min(0.05, now - last), now - t0, now
 
+            ts = max(last_ts + 1, int(t * 1000))             # VIDEO mode rejects repeated timestamps
+            last_ts = ts
             res = landmarker.detect_for_video(
                 mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)),
-                int(t * 1000))
+                ts)
 
             renderer.reset()
             seen = [False, False]
             labels = []
-            for i, (lms, hd) in enumerate(zip(res.hand_landmarks[:2], res.handedness[:2])):
-                seen[i] = True
+            hands = []
+            for lms, hd in zip(res.hand_landmarks[:2], res.handedness[:2]):
                 pts = np.array([[p.x * w, p.y * h, p.z * w] for p in lms])
+                hands.append((pts, hd[0].category_name, pts[[0, 5, 9, 13, 17], :2].mean(axis=0)))
+            slots = assign([c for _, _, c in hands], states)
+            for i, (pts, label, centre) in zip(slots, hands):
+                seen[i] = True
                 st = states[i]
-                palm, aim, reach = analyse(pts, hd[0].category_name, args.flip_palm)
-                centre = pts[[0, 5, 9, 13, 17], :2].mean(axis=0)
+                palm, aim, reach = analyse(pts, label, args.flip_palm)
                 k = 0.35 if st.seen else 1.0
                 st.center = st.center + (centre - st.center) * k
                 st.direction = unit(st.direction + (aim - st.direction) * 0.25)
